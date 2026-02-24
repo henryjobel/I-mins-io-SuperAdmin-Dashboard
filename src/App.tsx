@@ -44,9 +44,15 @@ import {
   inviteAdmin as inviteAdminApi,
   loadSettingsForms,
   loginSuperAdmin,
+  markThemeSynced as markThemeSyncedApi,
   patchSetting,
+  resetPaymentFailures as resetPaymentFailuresApi,
   retrySubscription as retrySubscriptionApi,
+  rotatePlatformKeys as rotatePlatformKeysApi,
   restartService as restartServiceApi,
+  setMaintenanceMode as setMaintenanceModeApi,
+  syncSubscriptionPricing as syncSubscriptionPricingApi,
+  updateAiHardCap as updateAiHardCapApi,
   updateFlag as updateFlagApi,
   updateLifecycle as updateLifecycleApi,
   updatePaymentOps as updatePaymentOpsApi,
@@ -261,6 +267,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   const [flags, setFlags] = useState<FeatureFlag[]>([]);
   const [incidents, setIncidents] = useState<IncidentRecord[]>([]);
   const [modelUsageRows, setModelUsageRows] = useState<ModelUsageRecord[]>([]);
+  const [aiHardCapUsd, setAiHardCapUsd] = useState(150);
   const [auditEntries, setAuditEntries] = useState<AuditLog[]>([]);
   const [overviewMetrics, setOverviewMetrics] = useState<{
     from: string | null;
@@ -332,15 +339,6 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   const [paymentSortKey, setPaymentSortKey] = useState<"storeName" | "failedCheckout24h" | "checkoutSuccessRatePct">("storeName");
   const [paymentSortDirection, setPaymentSortDirection] = useState<SortDirection>("asc");
   const [paymentPage, setPaymentPage] = useState(1);
-
-  const planPrice = useMemo(
-    () => ({
-      Starter: toNumber(planSettings.starterPrice, DEFAULT_PLAN_PRICE.Starter),
-      Growth: toNumber(planSettings.growthPrice, DEFAULT_PLAN_PRICE.Growth),
-      Scale: toNumber(planSettings.scalePrice, DEFAULT_PLAN_PRICE.Scale),
-    }),
-    [planSettings.growthPrice, planSettings.scalePrice, planSettings.starterPrice],
-  );
 
   const canManageStores = session.role === "super_admin" || session.role === "ops";
   const canRemoveStores = session.role === "super_admin";
@@ -472,7 +470,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     setDataState("loading");
     try {
       const range = getOverviewRange(timeframe);
-      const [nextStores, nextLifecycle, nextSubscriptions, nextPaymentOps, nextAdmins, nextTickets, nextServices, nextFlags, nextIncidents, nextAuditLogs, nextAiUsage, nextMetrics, nextSettings] =
+      const [nextStores, nextLifecycle, nextSubscriptions, nextPaymentOps, nextAdmins, nextTickets, nextHealthSnapshot, nextFlags, nextIncidents, nextAuditLogs, nextAiUsageSnapshot, nextMetrics, nextSettings] =
         await Promise.all([
           allowedSections.includes("stores")
             ? loadSectionSafely(() => fetchStores(), [] as StoreRecord[])
@@ -493,8 +491,11 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
             ? loadSectionSafely(() => fetchTickets(), [] as SupportTicket[])
             : Promise.resolve<SupportTicket[]>([]),
           allowedSections.includes("health")
-            ? loadSectionSafely(() => fetchHealth(), [] as ServiceRecord[])
-            : Promise.resolve<ServiceRecord[]>([]),
+            ? loadSectionSafely(
+                () => fetchHealth(),
+                { services: [] as ServiceRecord[], maintenanceMode: false },
+              )
+            : Promise.resolve({ services: [] as ServiceRecord[], maintenanceMode: false }),
           allowedSections.includes("flags")
             ? loadSectionSafely(() => fetchFlags(), [] as FeatureFlag[])
             : Promise.resolve<FeatureFlag[]>([]),
@@ -505,8 +506,19 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
             ? loadSectionSafely(() => fetchAuditLogs(), [] as AuditLog[])
             : Promise.resolve<AuditLog[]>([]),
           allowedSections.includes("ai-usage")
-            ? loadSectionSafely(() => fetchAiUsage(), [] as ModelUsageRecord[])
-            : Promise.resolve<ModelUsageRecord[]>([]),
+            ? loadSectionSafely(
+                () => fetchAiUsage(),
+                {
+                  models: [] as ModelUsageRecord[],
+                  hardCapUsd: 150,
+                  utilizationPct: 0,
+                },
+              )
+            : Promise.resolve({
+                models: [] as ModelUsageRecord[],
+                hardCapUsd: 150,
+                utilizationPct: 0,
+              }),
           allowedSections.includes("overview")
             ? loadSectionSafely(
                 () => fetchOverviewMetrics(range.from, range.to),
@@ -571,11 +583,13 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       setPaymentOpsRows(nextPaymentOps);
       setAdmins(nextAdmins);
       setTickets(nextTickets);
-      setServices(nextServices);
+      setServices(nextHealthSnapshot.services);
+      setMaintenanceMode(nextHealthSnapshot.maintenanceMode);
       setFlags(nextFlags);
       setIncidents(nextIncidents);
       setAuditEntries(nextAuditLogs);
-      setModelUsageRows(nextAiUsage);
+      setModelUsageRows(nextAiUsageSnapshot.models);
+      setAiHardCapUsd(nextAiUsageSnapshot.hardCapUsd);
       setOverviewMetrics(nextMetrics);
       if (nextSettings) {
         setSettingsForm(nextSettings.coreSettings);
@@ -800,8 +814,16 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
 
   const refreshHealthData = async () => {
     if (!allowedSections.includes("health")) return;
-    const nextRows = await fetchHealth();
-    setServices(nextRows);
+    const nextSnapshot = await fetchHealth();
+    setServices(nextSnapshot.services);
+    setMaintenanceMode(nextSnapshot.maintenanceMode);
+  };
+
+  const refreshAiUsageData = async () => {
+    if (!allowedSections.includes("ai-usage")) return;
+    const nextSnapshot = await fetchAiUsage();
+    setModelUsageRows(nextSnapshot.models);
+    setAiHardCapUsd(nextSnapshot.hardCapUsd);
   };
 
   const refreshFlagsData = async () => {
@@ -941,18 +963,21 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     void loadDashboardData();
   };
 
-  const toggleMaintenanceMode = () => {
+  const toggleMaintenanceMode = async () => {
     if (!(session.role === "super_admin" || session.role === "ops")) {
       pushToast("Only super admin or ops can toggle maintenance mode.", "error");
       return;
     }
 
-    setMaintenanceMode((current) => {
-      const next = !current;
-      appendAudit(`simulated maintenance mode ${next ? "enabled" : "disabled"}`, "platform-maintenance", "high");
-      pushToast(`Maintenance mode ${next ? "enabled" : "disabled"} (simulated).`, "info");
-      return next;
-    });
+    try {
+      const next = !maintenanceMode;
+      const updated = await setMaintenanceModeApi(next);
+      setMaintenanceMode(updated.enabled);
+      await refreshAuditLogs();
+      pushToast(`Maintenance mode ${updated.enabled ? "enabled" : "disabled"}.`, "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update maintenance mode");
+    }
   };
 
   const saveCoreSettingsDraft = async () => {
@@ -996,16 +1021,50 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
 
     try {
       await patchSetting("super_admin:plan_settings", { ...planSettings });
-      await refreshAuditLogs();
-      setSubscriptions((current) =>
-        current.map((subscription) =>
-          subscription.status === "active" ? { ...subscription, amountUsd: planPrice[subscription.plan] } : subscription,
-        ),
-      );
-      appendAudit("simulated active subscription pricing sync", "plan-policy", "medium");
-      pushToast("Plan rules saved. Active subscription pricing sync is simulated.", "success");
+      const synced = await syncSubscriptionPricingApi();
+      await Promise.all([refreshSubscriptionsData(), refreshAuditLogs()]);
+      pushToast(`Plan rules saved. ${synced.updated} active subscriptions re-priced.`, "success");
     } catch (error) {
       handleApiActionError(error, "Failed to save plan settings");
+    }
+  };
+
+  const rotatePlatformKeys = async () => {
+    if (session.role !== "super_admin") {
+      pushToast("Only super admin can rotate platform keys.", "error");
+      return;
+    }
+
+    try {
+      const result = await rotatePlatformKeysApi();
+      await refreshAuditLogs();
+      pushToast(`Platform keys rotated (v${result.keyVersion}).`, "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to rotate platform keys");
+    }
+  };
+
+  const updateAiHardCap = async () => {
+    if (!(session.role === "super_admin" || session.role === "ops")) {
+      pushToast("Only super admin or ops can update AI hard cap.", "error");
+      return;
+    }
+
+    const requested = window.prompt("Enter AI hard cap in USD", String(aiHardCapUsd));
+    if (requested === null) return;
+    const parsed = Number(requested);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      pushToast("Please enter a valid positive number for hard cap.", "error");
+      return;
+    }
+
+    try {
+      const result = await updateAiHardCapApi(parsed);
+      setAiHardCapUsd(result.hardCapUsd);
+      await Promise.all([refreshAiUsageData(), refreshAuditLogs()]);
+      pushToast(`AI hard cap updated to ${usd(result.hardCapUsd)}.`, "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update AI hard cap");
     }
   };
 
@@ -1192,18 +1251,19 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     }
   };
 
-  const markThemeUpdated = (storeId: string) => {
+  const markThemeUpdated = async (storeId: string) => {
     if (!canManageLifecycle) {
       pushToast("Only super admin or ops can update theme freshness.", "error");
       return;
     }
 
-    const today = todayIso();
-    setLifecycleRows((current) =>
-      current.map((row) => (row.storeId === storeId ? { ...row, lastThemeUpdateAt: today } : row)),
-    );
-    appendAudit("simulated theme sync mark", storeId, "low");
-    pushToast("Theme update timestamp refreshed (simulated).", "info");
+    try {
+      await markThemeSyncedApi(storeId);
+      await Promise.all([refreshLifecycleData(), refreshAuditLogs()]);
+      pushToast("Theme update timestamp refreshed.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to mark theme sync");
+    }
   };
 
   const toggleStripe = async (storeId: string) => {
@@ -1298,19 +1358,19 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     }
   };
 
-  const resetFailedCheckouts = (storeId: string) => {
+  const resetFailedCheckouts = async (storeId: string) => {
     if (!canManagePaymentOps) {
       pushToast("You do not have permission to reset checkout counters.", "error");
       return;
     }
 
-    setPaymentOpsRows((current) =>
-      current.map((row) =>
-        row.storeId === storeId ? { ...row, failedCheckout24h: 0, checkoutSuccessRatePct: Math.max(row.checkoutSuccessRatePct, 98) } : row,
-      ),
-    );
-    appendAudit("simulated reset failed checkout counter", storeId, "low");
-    pushToast("Checkout failure counter reset (simulated).", "info");
+    try {
+      await resetPaymentFailuresApi(storeId);
+      await Promise.all([refreshPaymentOpsData(), refreshAuditLogs()]);
+      pushToast("Checkout failure counter reset.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to reset failed checkouts");
+    }
   };
 
   const changeSubscriptionPlan = async (subscriptionId: string) => {
@@ -1814,7 +1874,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
                           disabled={!canManageLifecycle}
                           className="rounded-lg bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          Theme Synced (Simulated)
+                          Theme Synced
                         </button>
                       </div>
                     </td>
@@ -1996,7 +2056,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
                           disabled={!canManagePaymentOps}
                           className="rounded-lg bg-brand-soft px-2.5 py-1 text-xs font-semibold text-brand-deep hover:bg-brand-soft/80 disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          Reset Failures (Simulated)
+                          Reset Failures
                         </button>
                       </td>
                     </tr>
@@ -2419,12 +2479,12 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       <SectionCard title="Safety Controls" subtitle="Global operational switches">
         <div className="space-y-3">
           <button
-            onClick={toggleMaintenanceMode}
+            onClick={() => void toggleMaintenanceMode()}
             className={`w-full rounded-xl px-4 py-2.5 text-sm font-semibold ${
               maintenanceMode ? "bg-red-600 text-white hover:bg-red-700" : "bg-brand text-white hover:bg-brand-deep"
             }`}
           >
-            {maintenanceMode ? "Disable Maintenance Mode (Simulated)" : "Enable Maintenance Mode (Simulated)"}
+            {maintenanceMode ? "Disable Maintenance Mode" : "Enable Maintenance Mode"}
           </button>
           <p className="text-xs text-slate-500">
             Maintenance mode should be enabled only for migrations that require checkout freeze.
@@ -2485,17 +2545,17 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
           <p className="text-sm text-slate-500">Current month spend</p>
           <p className="mt-1 text-3xl font-bold text-slate-900">{usd(totalCost)}</p>
           <div className="mt-4 h-2 rounded-full bg-slate-100">
-            <div className="h-2 rounded-full bg-sunset" style={{ width: `${Math.min(100, (totalCost / 150) * 100)}%` }} />
+            <div
+              className="h-2 rounded-full bg-sunset"
+              style={{ width: `${Math.min(100, (totalCost / Math.max(aiHardCapUsd, 1)) * 100)}%` }}
+            />
           </div>
-          <p className="mt-2 text-xs text-slate-500">Soft limit: $150</p>
+          <p className="mt-2 text-xs text-slate-500">Hard cap: {usd(aiHardCapUsd)}</p>
           <button
-            onClick={() => {
-              appendAudit("simulated ai hard cap update", "ai-budget", "medium");
-              pushToast("AI hard cap update is simulated.", "info");
-            }}
+            onClick={() => void updateAiHardCap()}
             className="mt-4 w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
           >
-            Update Hard Cap (Simulated)
+            Update Hard Cap
           </button>
         </SectionCard>
       </div>
@@ -2585,17 +2645,10 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
           </li>
         </ul>
         <button
-          onClick={() => {
-            if (session.role !== "super_admin") {
-              pushToast("Only super admin can rotate platform keys.", "error");
-              return;
-            }
-            appendAudit("simulated platform key rotation", "platform-keys", "high");
-            pushToast("Platform key rotation is simulated.", "info");
-          }}
+          onClick={() => void rotatePlatformKeys()}
           className="mt-4 w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
         >
-          Rotate Platform Keys (Simulated)
+          Rotate Platform Keys
         </button>
       </SectionCard>
     </div>
@@ -2705,7 +2758,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
               onClick={() => void savePlanRules()}
               className="w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
             >
-              Save Plan Rules (Pricing Sync Simulated)
+              Save Plan Rules
             </button>
           </div>
         ) : (
@@ -2797,7 +2850,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
           <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-xs text-slate-600">
             <Server className="h-4 w-4 text-brand-deep" />
             Dashboard data is API-driven.
-            <span className="font-semibold text-slate-800">Only labeled simulated actions use local state.</span>
+            <span className="font-semibold text-slate-800">Super admin controls are connected with backend endpoints.</span>
           </div>
         </main>
       </div>
@@ -2978,11 +3031,6 @@ function nextIdFromExisting(existingIds: string[], prefix: string, fallbackStart
   }, fallbackStart);
 
   return `${prefix}${max + 1}`;
-}
-
-function toNumber(value: string, fallback: number) {
-  const numeric = Number.parseFloat(value);
-  return Number.isNaN(numeric) ? fallback : numeric;
 }
 
 function usd(value: number) {
