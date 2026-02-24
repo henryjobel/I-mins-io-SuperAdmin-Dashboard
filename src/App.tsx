@@ -26,20 +26,54 @@ import { ToastItem, ToastViewport } from "@/components/common/ToastViewport";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Timeframe, Topbar } from "@/components/layout/Topbar";
 import {
-  adminRecords,
-  auditLogs,
-  incidentRecords,
-  modelUsageRecords,
-  paymentOpsRecords,
-  platformFlags,
-  serviceRecords,
-  storeLifecycleRecords,
-  storeRecords,
-  subscriptionRecords,
-  supportTickets,
-} from "@/data/mockData";
-import { useAuditLog } from "@/hooks/useAuditLog";
-import { AdminRole, SectionId, StorePlan, StoreStatus, SubscriptionStatus } from "@/types/admin";
+  cancelSubscription as cancelSubscriptionApi,
+  createStore as createStoreApi,
+  deleteStore as deleteStoreApi,
+  fetchAdmins,
+  fetchAiUsage,
+  fetchAuditLogs,
+  fetchFlags,
+  fetchHealth,
+  fetchIncidents,
+  fetchLifecycle,
+  fetchOverviewMetrics,
+  fetchPaymentOps,
+  fetchStores,
+  fetchSubscriptions,
+  fetchTickets,
+  inviteAdmin as inviteAdminApi,
+  loadSettingsForms,
+  loginSuperAdmin,
+  patchSetting,
+  retrySubscription as retrySubscriptionApi,
+  restartService as restartServiceApi,
+  updateFlag as updateFlagApi,
+  updateLifecycle as updateLifecycleApi,
+  updatePaymentOps as updatePaymentOpsApi,
+  updateStoreStatus as updateStoreStatusApi,
+  updateSubscription as updateSubscriptionApi,
+  updateTicket as updateTicketApi,
+  upsertSettingsBatch,
+} from "@/lib/superAdminApi";
+import {
+  AdminRole,
+  AuditLog,
+  FeatureFlag,
+  IncidentRecord,
+  ModelUsageRecord,
+  SectionId,
+  ServiceRecord,
+  StoreLifecycleRecord,
+  StorePlan,
+  StoreRecord,
+  StoreStatus,
+  SubscriptionRecord,
+  SubscriptionStatus,
+  SupportTicket,
+  PaymentOpsRecord,
+  AdminRecord,
+} from "@/types/admin";
+import { ApiError, clearAuthTokens, getAccessToken } from "@/lib/http";
 
 const navItems: { id: SectionId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -127,13 +161,6 @@ const roleSectionAccess: Record<AdminRole, SectionId[]> = {
   finance: ["overview", "stores", "subscriptions", "payment-ops"],
 };
 
-const demoAccounts: { email: string; password: string; name: string; role: AdminRole }[] = [
-  { email: "mahin@nexus.ai", password: "admin123", name: "Mahin Chowdhury", role: "super_admin" },
-  { email: "sadia.ops@nexus.ai", password: "ops123", name: "Sadia Noor", role: "ops" },
-  { email: "jannat.support@nexus.ai", password: "support123", name: "Jannat Rafi", role: "support" },
-  { email: "riyad.finance@nexus.ai", password: "finance123", name: "Riyad Hasan", role: "finance" },
-];
-
 const DEFAULT_PLAN_PRICE: Record<StorePlan, number> = {
   Starter: 39,
   Growth: 129,
@@ -148,6 +175,11 @@ interface AuthSession {
   role: AdminRole;
 }
 
+interface LoginResult {
+  ok: boolean;
+  message?: string;
+}
+
 function isSection(value: string): value is SectionId {
   return navItems.some((item) => item.id === value);
 }
@@ -159,17 +191,20 @@ export default function App() {
     persistSession(session);
   }, [session]);
 
-  const handleLogin = (email: string, password: string) => {
-    const account = demoAccounts.find(
-      (item) => item.email.toLowerCase() === email.trim().toLowerCase() && item.password === password,
-    );
-    if (!account) return false;
-
-    setSession({ name: account.name, email: account.email, role: account.role });
-    return true;
+  const handleLogin = async (email: string, password: string): Promise<LoginResult> => {
+    try {
+      const session = await loginSuperAdmin(email, password);
+      setSession(session);
+      return { ok: true };
+    } catch (error) {
+      clearAuthTokens();
+      const message = error instanceof Error ? error.message : "Login failed";
+      return { ok: false, message };
+    }
   };
 
   const handleLogout = () => {
+    clearAuthTokens();
     setSession(null);
   };
 
@@ -208,16 +243,33 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     }
   }, [allowedSections, fallbackSection, navigate, rawSection]);
 
+  useEffect(() => {
+    if (!getAccessToken()) {
+      onLogout();
+    }
+  }, [onLogout]);
+
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [timeframe, setTimeframe] = useState<Timeframe>("30d");
-  const [stores, setStores] = useState(storeRecords);
-  const [lifecycleRows, setLifecycleRows] = useState(storeLifecycleRecords);
-  const [subscriptions, setSubscriptions] = useState(subscriptionRecords);
-  const [paymentOpsRows, setPaymentOpsRows] = useState(paymentOpsRecords);
-  const [admins, setAdmins] = useState(adminRecords);
-  const [tickets, setTickets] = useState(supportTickets);
-  const [services, setServices] = useState(serviceRecords);
-  const [flags, setFlags] = useState(platformFlags);
+  const [stores, setStores] = useState<StoreRecord[]>([]);
+  const [lifecycleRows, setLifecycleRows] = useState<StoreLifecycleRecord[]>([]);
+  const [subscriptions, setSubscriptions] = useState<SubscriptionRecord[]>([]);
+  const [paymentOpsRows, setPaymentOpsRows] = useState<PaymentOpsRecord[]>([]);
+  const [admins, setAdmins] = useState<AdminRecord[]>([]);
+  const [tickets, setTickets] = useState<SupportTicket[]>([]);
+  const [services, setServices] = useState<ServiceRecord[]>([]);
+  const [flags, setFlags] = useState<FeatureFlag[]>([]);
+  const [incidents, setIncidents] = useState<IncidentRecord[]>([]);
+  const [modelUsageRows, setModelUsageRows] = useState<ModelUsageRecord[]>([]);
+  const [auditEntries, setAuditEntries] = useState<AuditLog[]>([]);
+  const [overviewMetrics, setOverviewMetrics] = useState<{
+    from: string | null;
+    to: string | null;
+    totalRevenue: number;
+    totalOrders: number;
+    activeStores: number;
+    failedPayments: number;
+  } | null>(null);
   const [maintenanceMode, setMaintenanceMode] = useState(false);
 
   const [storeQuery, setStoreQuery] = useState("");
@@ -298,16 +350,6 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   const canManageAdmins = session.role === "super_admin";
   const canManageSettings = session.role === "super_admin";
 
-  const { entries: auditEntries, append: appendAudit } = useAuditLog({
-    initial: auditLogs,
-    actor: session.name,
-  });
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => setDataState("ready"), 650);
-    return () => window.clearTimeout(timer);
-  }, []);
-
   useEffect(() => {
     setStorePage(1);
   }, [storeQuery, storeSortDirection, storeSortKey]);
@@ -347,6 +389,214 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   }) => {
     setConfirmState({ title, message, confirmLabel, tone, onConfirm });
   };
+
+  const appendAudit = (action: string, target: string, risk: AuditLog["risk"] = "low") => {
+    setAuditEntries((current) => {
+      const nextId = nextAuditId(current);
+      const nextEntry: AuditLog = {
+        id: nextId,
+        actor: session.name,
+        action,
+        target,
+        risk,
+        at: "just now",
+      };
+      return [nextEntry, ...current].slice(0, 250);
+    });
+  };
+
+  const apiErrorMessage = (error: unknown, fallback: string) => {
+    if (error instanceof ApiError) {
+      if (typeof error.payload === "object" && error.payload && "message" in error.payload) {
+        const payloadMessage = (error.payload as { message?: unknown }).message;
+        if (typeof payloadMessage === "string" && payloadMessage.trim()) {
+          return payloadMessage;
+        }
+      }
+      if (error.message) return error.message;
+    }
+    if (error instanceof Error && error.message) return error.message;
+    return fallback;
+  };
+
+  const handleApiActionError = (error: unknown, fallback: string) => {
+    if (error instanceof ApiError && error.status === 401) {
+      onLogout();
+      pushToast("Session expired. Please sign in again.", "error");
+      return;
+    }
+    pushToast(apiErrorMessage(error, fallback), "error");
+  };
+
+  const isPermissionError = (error: unknown) =>
+    error instanceof ApiError && (error.status === 403 || error.status === 404);
+  const isUnauthorizedError = (error: unknown) => error instanceof ApiError && error.status === 401;
+
+  const getOverviewRange = (selected: Timeframe) => {
+    const to = new Date();
+    const from = new Date(to);
+    if (selected === "7d") from.setDate(from.getDate() - 7);
+    if (selected === "30d") from.setDate(from.getDate() - 30);
+    if (selected === "90d") from.setDate(from.getDate() - 90);
+    return { from: from.toISOString(), to: to.toISOString() };
+  };
+
+  const loadSectionSafely = async <T,>(load: () => Promise<T>, fallback: T) => {
+    try {
+      return await load();
+    } catch (error) {
+      if (isPermissionError(error)) {
+        return fallback;
+      }
+      throw error;
+    }
+  };
+
+  const refreshAuditLogs = async () => {
+    if (!allowedSections.includes("security")) return;
+    try {
+      const rows = await fetchAuditLogs();
+      setAuditEntries(rows);
+    } catch (error) {
+      if (isUnauthorizedError(error)) {
+        onLogout();
+        return;
+      }
+      if (!isPermissionError(error)) {
+        handleApiActionError(error, "Failed to refresh audit logs");
+      }
+    }
+  };
+
+  const loadDashboardData = async () => {
+    setDataState("loading");
+    try {
+      const range = getOverviewRange(timeframe);
+      const [nextStores, nextLifecycle, nextSubscriptions, nextPaymentOps, nextAdmins, nextTickets, nextServices, nextFlags, nextIncidents, nextAuditLogs, nextAiUsage, nextMetrics, nextSettings] =
+        await Promise.all([
+          allowedSections.includes("stores")
+            ? loadSectionSafely(() => fetchStores(), [] as StoreRecord[])
+            : Promise.resolve<StoreRecord[]>([]),
+          allowedSections.includes("lifecycle")
+            ? loadSectionSafely(() => fetchLifecycle(), [] as StoreLifecycleRecord[])
+            : Promise.resolve<StoreLifecycleRecord[]>([]),
+          allowedSections.includes("subscriptions")
+            ? loadSectionSafely(() => fetchSubscriptions(), [] as SubscriptionRecord[])
+            : Promise.resolve<SubscriptionRecord[]>([]),
+          allowedSections.includes("payment-ops")
+            ? loadSectionSafely(() => fetchPaymentOps(), [] as PaymentOpsRecord[])
+            : Promise.resolve<PaymentOpsRecord[]>([]),
+          allowedSections.includes("admins")
+            ? loadSectionSafely(() => fetchAdmins(), [] as AdminRecord[])
+            : Promise.resolve<AdminRecord[]>([]),
+          allowedSections.includes("support")
+            ? loadSectionSafely(() => fetchTickets(), [] as SupportTicket[])
+            : Promise.resolve<SupportTicket[]>([]),
+          allowedSections.includes("health")
+            ? loadSectionSafely(() => fetchHealth(), [] as ServiceRecord[])
+            : Promise.resolve<ServiceRecord[]>([]),
+          allowedSections.includes("flags")
+            ? loadSectionSafely(() => fetchFlags(), [] as FeatureFlag[])
+            : Promise.resolve<FeatureFlag[]>([]),
+          allowedSections.includes("security")
+            ? loadSectionSafely(() => fetchIncidents(), [] as IncidentRecord[])
+            : Promise.resolve<IncidentRecord[]>([]),
+          allowedSections.includes("security")
+            ? loadSectionSafely(() => fetchAuditLogs(), [] as AuditLog[])
+            : Promise.resolve<AuditLog[]>([]),
+          allowedSections.includes("ai-usage")
+            ? loadSectionSafely(() => fetchAiUsage(), [] as ModelUsageRecord[])
+            : Promise.resolve<ModelUsageRecord[]>([]),
+          allowedSections.includes("overview")
+            ? loadSectionSafely(
+                () => fetchOverviewMetrics(range.from, range.to),
+                null as {
+                  from: string | null;
+                  to: string | null;
+                  totalRevenue: number;
+                  totalOrders: number;
+                  activeStores: number;
+                  failedPayments: number;
+                } | null,
+              )
+            : Promise.resolve<{
+                from: string | null;
+                to: string | null;
+                totalRevenue: number;
+                totalOrders: number;
+                activeStores: number;
+                failedPayments: number;
+              } | null>(null),
+          allowedSections.includes("settings")
+            ? loadSectionSafely(
+                () => loadSettingsForms(),
+                null as {
+                  coreSettings: {
+                    platformName: string;
+                    defaultCurrency: string;
+                    alertEmail: string;
+                    sessionTimeout: string;
+                    webhookRetries: string;
+                  };
+                  planSettings: {
+                    starterPrice: string;
+                    growthPrice: string;
+                    scalePrice: string;
+                    trialDays: string;
+                    graceDays: string;
+                  };
+                } | null,
+              )
+            : Promise.resolve<{
+                coreSettings: {
+                  platformName: string;
+                  defaultCurrency: string;
+                  alertEmail: string;
+                  sessionTimeout: string;
+                  webhookRetries: string;
+                };
+                planSettings: {
+                  starterPrice: string;
+                  growthPrice: string;
+                  scalePrice: string;
+                  trialDays: string;
+                  graceDays: string;
+                };
+              } | null>(null),
+        ]);
+
+      setStores(nextStores);
+      setLifecycleRows(nextLifecycle);
+      setSubscriptions(nextSubscriptions);
+      setPaymentOpsRows(nextPaymentOps);
+      setAdmins(nextAdmins);
+      setTickets(nextTickets);
+      setServices(nextServices);
+      setFlags(nextFlags);
+      setIncidents(nextIncidents);
+      setAuditEntries(nextAuditLogs);
+      setModelUsageRows(nextAiUsage);
+      setOverviewMetrics(nextMetrics);
+      if (nextSettings) {
+        setSettingsForm(nextSettings.coreSettings);
+        setPlanSettings(nextSettings.planSettings);
+      }
+
+      setDataState("ready");
+    } catch (error) {
+      if (isUnauthorizedError(error)) {
+        onLogout();
+        return;
+      }
+      setDataState("error");
+      handleApiActionError(error, "Failed to load dashboard data");
+    }
+  };
+
+  useEffect(() => {
+    void loadDashboardData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.role, timeframe]);
 
   const filteredStores = useMemo(() => {
     const key = storeQuery.toLowerCase().trim();
@@ -490,7 +740,6 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   );
 
   const activeStores = stores.filter((store) => store.status !== "suspended").length;
-  const activeAdmins = admins.filter((admin) => admin.status === "active").length;
   const openTickets = tickets.filter((ticket) => ticket.status !== "resolved").length;
   const activeSubscriptions = subscriptions.filter((subscription) => subscription.status === "active");
   const monthlyRecurringRevenue = activeSubscriptions.reduce((sum, subscription) => sum + subscription.amountUsd, 0);
@@ -509,11 +758,65 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       (row.stripeEnabled && row.stripeMode === "live") || (row.sslCommerzEnabled && row.sslCommerzMode === "live"),
   ).length;
   const paymentIssueStores = paymentOpsRows.filter((row) => row.failedCheckout24h >= 3).length;
-  const aiCost = modelUsageRecords.reduce((sum, record) => sum + record.costUsd, 0);
+  const aiCost = modelUsageRows.reduce((sum, record) => sum + record.costUsd, 0);
 
   const timeframeLabel = timeframe === "7d" ? "last 7 days" : timeframe === "30d" ? "last 30 days" : "last 90 days";
 
-  const handleInvite = (event: FormEvent) => {
+  const refreshStoresData = async () => {
+    if (!allowedSections.includes("stores")) return;
+    const nextStores = await fetchStores();
+    setStores(nextStores);
+  };
+
+  const refreshLifecycleData = async () => {
+    if (!allowedSections.includes("lifecycle")) return;
+    const nextRows = await fetchLifecycle();
+    setLifecycleRows(nextRows);
+  };
+
+  const refreshSubscriptionsData = async () => {
+    if (!allowedSections.includes("subscriptions")) return;
+    const nextRows = await fetchSubscriptions();
+    setSubscriptions(nextRows);
+  };
+
+  const refreshPaymentOpsData = async () => {
+    if (!allowedSections.includes("payment-ops")) return;
+    const nextRows = await fetchPaymentOps();
+    setPaymentOpsRows(nextRows);
+  };
+
+  const refreshAdminsData = async () => {
+    if (!allowedSections.includes("admins")) return;
+    const nextRows = await fetchAdmins();
+    setAdmins(nextRows);
+  };
+
+  const refreshTicketsData = async () => {
+    if (!allowedSections.includes("support")) return;
+    const nextRows = await fetchTickets();
+    setTickets(nextRows);
+  };
+
+  const refreshHealthData = async () => {
+    if (!allowedSections.includes("health")) return;
+    const nextRows = await fetchHealth();
+    setServices(nextRows);
+  };
+
+  const refreshFlagsData = async () => {
+    if (!allowedSections.includes("flags")) return;
+    const nextRows = await fetchFlags();
+    setFlags(nextRows);
+  };
+
+  const refreshIncidentsData = async () => {
+    if (!allowedSections.includes("security")) return;
+    const nextRows = await fetchIncidents();
+    setIncidents(nextRows);
+  };
+
+  const handleInvite = async (event: FormEvent) => {
     event.preventDefault();
     if (!canManageAdmins) {
       pushToast("Only super admin can invite internal admins.", "error");
@@ -524,23 +827,21 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     const email = inviteEmail.trim();
     if (!name || !email) return;
 
-    setAdmins((current) => [
-      {
-        id: `ADM-${String(current.length + 1).padStart(2, "0")}`,
+    try {
+      await inviteAdminApi({
         name,
         email,
         role: inviteRole,
-        status: "invited",
-        lastActive: "pending",
-      },
-      ...current,
-    ]);
-
-    setInviteName("");
-    setInviteEmail("");
-    setInviteRole("ops");
-    appendAudit("invited admin user", email, "medium");
-    pushToast(`Invite sent to ${email}.`, "success");
+      });
+      setInviteName("");
+      setInviteEmail("");
+      setInviteRole("ops");
+      await refreshAdminsData();
+      await refreshAuditLogs();
+      pushToast(`Invite sent to ${email}.`, "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to invite admin");
+    }
   };
 
   const toggleStoreStatus = (storeId: string) => {
@@ -559,59 +860,73 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       confirmLabel: nextStatus === "suspended" ? "Suspend" : "Reactivate",
       tone: nextStatus === "suspended" ? "danger" : "default",
       onConfirm: () => {
-        setStores((current) =>
-          current.map((store) => (store.id === storeId ? { ...store, status: nextStatus } : store)),
-        );
-        appendAudit(`${nextStatus === "suspended" ? "suspended" : "reactivated"} store`, storeId, "high");
-        pushToast(`Store ${nextStatus}.`, "success");
+        void (async () => {
+          try {
+            await updateStoreStatusApi(storeId, nextStatus);
+            await Promise.all([
+              refreshStoresData(),
+              refreshSubscriptionsData(),
+              refreshAuditLogs(),
+            ]);
+            pushToast(`Store ${nextStatus}.`, "success");
+          } catch (error) {
+            handleApiActionError(error, "Failed to update store status");
+          }
+        })();
       },
     });
   };
 
-  const resolveTicket = (ticketId: string) => {
+  const resolveTicket = async (ticketId: string) => {
     if (!(session.role === "super_admin" || session.role === "ops" || session.role === "support")) {
       pushToast("You do not have access to resolve tickets.", "error");
       return;
     }
 
-    setTickets((current) =>
-      current.map((ticket) => (ticket.id === ticketId ? { ...ticket, status: "resolved" } : ticket)),
-    );
-    appendAudit("resolved support ticket", ticketId, "low");
-    pushToast("Ticket marked as resolved.", "success");
+    try {
+      await updateTicketApi(ticketId, { status: "resolved" });
+      await Promise.all([refreshTicketsData(), refreshAuditLogs()]);
+      pushToast("Ticket marked as resolved.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to resolve ticket");
+    }
   };
 
-  const restartService = (serviceName: string) => {
+  const restartService = async (serviceName: string) => {
     if (!(session.role === "super_admin" || session.role === "ops")) {
       pushToast("Only super admin or ops can restart services.", "error");
       return;
     }
 
-    setServices((current) =>
-      current.map((service) =>
-        service.name === serviceName
-          ? {
-              ...service,
-              status: "healthy",
-              latencyMs: Math.max(45, service.latencyMs - 35),
-              uptimePct: Math.min(99.99, service.uptimePct + 0.2),
-            }
-          : service,
-      ),
-    );
-    appendAudit("restarted platform service", serviceName, "high");
-    pushToast(`${serviceName} restart triggered.`, "info");
+    try {
+      await restartServiceApi(serviceName);
+      await Promise.all([refreshHealthData(), refreshAuditLogs()]);
+      pushToast(`${serviceName} restart triggered.`, "info");
+    } catch (error) {
+      handleApiActionError(error, "Failed to restart service");
+    }
   };
 
-  const toggleFlag = (key: string) => {
+  const toggleFlag = async (key: string) => {
     if (!(session.role === "super_admin" || session.role === "ops")) {
       pushToast("Only super admin or ops can toggle feature flags.", "error");
       return;
     }
 
-    setFlags((current) => current.map((flag) => (flag.key === key ? { ...flag, enabled: !flag.enabled } : flag)));
-    appendAudit("toggled feature flag", key, "medium");
-    pushToast(`Feature flag ${key} updated.`, "success");
+    const target = flags.find((flag) => flag.key === key);
+    if (!target) return;
+
+    try {
+      await updateFlagApi(key, {
+        enabled: !target.enabled,
+        description: target.description,
+        rolloutPct: target.rolloutPct,
+      });
+      await Promise.all([refreshFlagsData(), refreshAuditLogs()]);
+      pushToast(`Feature flag ${key} updated.`, "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update feature flag");
+    }
   };
 
   const updateSetting = (key: keyof typeof settingsForm, value: string) => {
@@ -623,11 +938,75 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   };
 
   const retryDataLoad = () => {
-    setDataState("loading");
-    window.setTimeout(() => {
-      setDataState("ready");
-      pushToast("Data reloaded successfully.", "success");
-    }, 700);
+    void loadDashboardData();
+  };
+
+  const toggleMaintenanceMode = () => {
+    if (!(session.role === "super_admin" || session.role === "ops")) {
+      pushToast("Only super admin or ops can toggle maintenance mode.", "error");
+      return;
+    }
+
+    setMaintenanceMode((current) => {
+      const next = !current;
+      appendAudit(`simulated maintenance mode ${next ? "enabled" : "disabled"}`, "platform-maintenance", "high");
+      pushToast(`Maintenance mode ${next ? "enabled" : "disabled"} (simulated).`, "info");
+      return next;
+    });
+  };
+
+  const saveCoreSettingsDraft = async () => {
+    if (!canManageSettings) {
+      pushToast("Only super admin can modify platform settings.", "error");
+      return;
+    }
+
+    try {
+      await patchSetting("super_admin:core_settings", { ...settingsForm });
+      await refreshAuditLogs();
+      pushToast("Core settings draft saved.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to save core settings draft");
+    }
+  };
+
+  const pushSettingsToProduction = async () => {
+    if (!canManageSettings) {
+      pushToast("Only super admin can modify platform settings.", "error");
+      return;
+    }
+
+    try {
+      await upsertSettingsBatch({
+        "super_admin:core_settings": { ...settingsForm },
+        "super_admin:plan_settings": { ...planSettings },
+      });
+      await refreshAuditLogs();
+      pushToast("Core and plan settings pushed to production.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to push settings");
+    }
+  };
+
+  const savePlanRules = async () => {
+    if (!canManageSettings) {
+      pushToast("Only super admin can update plan rules.", "error");
+      return;
+    }
+
+    try {
+      await patchSetting("super_admin:plan_settings", { ...planSettings });
+      await refreshAuditLogs();
+      setSubscriptions((current) =>
+        current.map((subscription) =>
+          subscription.status === "active" ? { ...subscription, amountUsd: planPrice[subscription.plan] } : subscription,
+        ),
+      );
+      appendAudit("simulated active subscription pricing sync", "plan-policy", "medium");
+      pushToast("Plan rules saved. Active subscription pricing sync is simulated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to save plan settings");
+    }
   };
 
   const exportSubscriptionsCsv = () => {
@@ -682,7 +1061,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     setNewStoreForm((current) => ({ ...current, [key]: value }));
   };
 
-  const handleAddStore = (event: FormEvent) => {
+  const handleAddStore = async (event: FormEvent) => {
     event.preventDefault();
     if (!canManageStores) {
       pushToast("Only super admin or ops can add stores.", "error");
@@ -697,88 +1076,35 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       return;
     }
 
-    const today = todayIso();
-    const storeId = nextIdFromExisting(stores.map((store) => store.id), "STR-", 1000);
-    const subscriptionId = nextIdFromExisting(subscriptions.map((subscription) => subscription.id), "SUB-", 3000);
-    const subscriptionStatus: SubscriptionStatus =
-      newStoreForm.status === "trial" ? "trial" : newStoreForm.status === "suspended" ? "cancelled" : "active";
-    const nextBillingDate =
-      subscriptionStatus === "active"
-        ? addDaysToIso(today, 30)
-        : subscriptionStatus === "trial"
-          ? addDaysToIso(today, 7)
-          : "N/A";
-
-    setStores((current) => [
-      {
-        id: storeId,
+    try {
+      await createStoreApi({
         name,
         ownerEmail,
         plan: newStoreForm.plan,
         region: newStoreForm.region,
-        gmvUsd: 0,
         status: newStoreForm.status,
-        createdAt: today,
-      },
-      ...current,
-    ]);
+      });
 
-    setSubscriptions((current) => [
-      {
-        id: subscriptionId,
-        storeId,
-        storeName: name,
-        ownerEmail,
-        plan: newStoreForm.plan,
-        status: subscriptionStatus,
-        amountUsd: subscriptionStatus === "active" ? planPrice[newStoreForm.plan] : 0,
-        nextBillingDate,
-        expiryDate: nextBillingDate,
-        lastPaymentDate: subscriptionStatus === "active" ? today : "N/A",
-        failedPaymentCount: 0,
-      },
-      ...current,
-    ]);
+      await Promise.all([
+        refreshStoresData(),
+        refreshSubscriptionsData(),
+        refreshLifecycleData(),
+        refreshPaymentOpsData(),
+        refreshAuditLogs(),
+      ]);
 
-    setLifecycleRows((current) => [
-      {
-        storeId,
-        storeName: name,
-        publishStatus: "draft",
-        domain: "N/A",
-        domainStatus: "not_connected",
-        sslStatus: "inactive",
-        lastPublishedAt: "N/A",
-        lastThemeUpdateAt: today,
-      },
-      ...current,
-    ]);
-
-    setPaymentOpsRows((current) => [
-      {
-        storeId,
-        storeName: name,
-        stripeEnabled: false,
-        stripeMode: "test",
-        sslCommerzEnabled: false,
-        sslCommerzMode: "test",
-        codEnabled: true,
-        failedCheckout24h: 0,
-        checkoutSuccessRatePct: 100,
-      },
-      ...current,
-    ]);
-
-    setNewStoreForm({
-      name: "",
-      ownerEmail: "",
-      plan: "Starter",
-      region: "US-East",
-      status: "trial",
-    });
-    setStoreFormOpen(false);
-    appendAudit("created store", storeId, "medium");
-    pushToast(`Store ${name} added.`, "success");
+      setNewStoreForm({
+        name: "",
+        ownerEmail: "",
+        plan: "Starter",
+        region: "US-East",
+        status: "trial",
+      });
+      setStoreFormOpen(false);
+      pushToast(`Store ${name} added.`, "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to create store");
+    }
   };
 
   const removeStore = (storeId: string) => {
@@ -796,67 +1122,74 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       confirmLabel: "Remove",
       tone: "danger",
       onConfirm: () => {
-        setStores((current) => current.filter((store) => store.id !== storeId));
-        setSubscriptions((current) => current.filter((subscription) => subscription.storeId !== storeId));
-        setLifecycleRows((current) => current.filter((row) => row.storeId !== storeId));
-        setPaymentOpsRows((current) => current.filter((row) => row.storeId !== storeId));
-        appendAudit("removed store", storeId, "high");
-        pushToast(`Store ${target.name} removed.`, "success");
+        void (async () => {
+          try {
+            await deleteStoreApi(storeId);
+            await Promise.all([
+              refreshStoresData(),
+              refreshSubscriptionsData(),
+              refreshLifecycleData(),
+              refreshPaymentOpsData(),
+              refreshAuditLogs(),
+            ]);
+            pushToast(`Store ${target.name} removed.`, "success");
+          } catch (error) {
+            handleApiActionError(error, "Failed to remove store");
+          }
+        })();
       },
     });
   };
 
-  const togglePublishStatus = (storeId: string) => {
+  const togglePublishStatus = async (storeId: string) => {
     if (!canManageLifecycle) {
       pushToast("Only super admin or ops can change publish status.", "error");
       return;
     }
 
-    const today = todayIso();
-    setLifecycleRows((current) =>
-      current.map((row) =>
-        row.storeId === storeId
-          ? {
-              ...row,
-              publishStatus: row.publishStatus === "published" ? "draft" : "published",
-              lastPublishedAt: row.publishStatus === "published" ? row.lastPublishedAt : today,
-            }
-          : row,
-        ),
-    );
-    appendAudit("toggled publish status", storeId, "medium");
-    pushToast("Publish status updated.", "success");
+    const target = lifecycleRows.find((row) => row.storeId === storeId);
+    if (!target) return;
+    const nextPublish = target.publishStatus === "published" ? "draft" : "published";
+
+    try {
+      await updateLifecycleApi(storeId, {
+        publishStatus: nextPublish,
+      });
+      await Promise.all([refreshLifecycleData(), refreshAuditLogs()]);
+      pushToast("Publish status updated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update publish status");
+    }
   };
 
-  const cycleDomainConnection = (storeId: string) => {
+  const cycleDomainConnection = async (storeId: string) => {
     if (!canManageLifecycle) {
       pushToast("Only super admin or ops can update domain state.", "error");
       return;
     }
 
-    setLifecycleRows((current) =>
-      current.map((row) => {
-        if (row.storeId !== storeId) return row;
+    const target = lifecycleRows.find((row) => row.storeId === storeId);
+    if (!target) return;
 
-        if (row.domainStatus === "not_connected") {
-          return {
-            ...row,
-            domainStatus: "verifying",
-            sslStatus: "pending",
-            domain:
-              row.domain !== "N/A" ? row.domain : `${row.storeName.toLowerCase().replace(/\s+/g, "")}.shopnexus.app`,
-          };
-        }
+    const nextDomainStatus =
+      target.domainStatus === "not_connected"
+        ? "verifying"
+        : target.domainStatus === "verifying"
+          ? "connected"
+          : "not_connected";
+    const nextSslStatus =
+      nextDomainStatus === "connected" ? "active" : nextDomainStatus === "verifying" ? "pending" : "inactive";
 
-        if (row.domainStatus === "verifying") {
-          return { ...row, domainStatus: "connected", sslStatus: "active" };
-        }
-
-        return { ...row, domainStatus: "not_connected", sslStatus: "inactive", domain: "N/A" };
-      }),
-    );
-    appendAudit("updated domain connection", storeId, "medium");
-    pushToast("Domain workflow step updated.", "success");
+    try {
+      await updateLifecycleApi(storeId, {
+        domainStatus: nextDomainStatus,
+        sslStatus: nextSslStatus,
+      });
+      await Promise.all([refreshLifecycleData(), refreshAuditLogs()]);
+      pushToast("Domain workflow step updated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update domain workflow");
+    }
   };
 
   const markThemeUpdated = (storeId: string) => {
@@ -869,77 +1202,100 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     setLifecycleRows((current) =>
       current.map((row) => (row.storeId === storeId ? { ...row, lastThemeUpdateAt: today } : row)),
     );
-    appendAudit("marked theme synced", storeId, "low");
-    pushToast("Theme update timestamp refreshed.", "success");
+    appendAudit("simulated theme sync mark", storeId, "low");
+    pushToast("Theme update timestamp refreshed (simulated).", "info");
   };
 
-  const toggleStripe = (storeId: string) => {
+  const toggleStripe = async (storeId: string) => {
     if (!canManagePaymentOps) {
       pushToast("You do not have permission to change payment gateways.", "error");
       return;
     }
 
-    setPaymentOpsRows((current) =>
-      current.map((row) => (row.storeId === storeId ? { ...row, stripeEnabled: !row.stripeEnabled } : row)),
-    );
-    appendAudit("toggled stripe gateway", storeId, "medium");
-    pushToast("Stripe setting updated.", "success");
+    const target = paymentOpsRows.find((row) => row.storeId === storeId);
+    if (!target) return;
+
+    try {
+      await updatePaymentOpsApi(storeId, { stripeEnabled: !target.stripeEnabled });
+      await Promise.all([refreshPaymentOpsData(), refreshAuditLogs()]);
+      pushToast("Stripe setting updated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update Stripe");
+    }
   };
 
-  const toggleSslCommerz = (storeId: string) => {
+  const toggleSslCommerz = async (storeId: string) => {
     if (!canManagePaymentOps) {
       pushToast("You do not have permission to change payment gateways.", "error");
       return;
     }
 
-    setPaymentOpsRows((current) =>
-      current.map((row) => (row.storeId === storeId ? { ...row, sslCommerzEnabled: !row.sslCommerzEnabled } : row)),
-    );
-    appendAudit("toggled sslcommerz gateway", storeId, "medium");
-    pushToast("SSLCommerz setting updated.", "success");
+    const target = paymentOpsRows.find((row) => row.storeId === storeId);
+    if (!target) return;
+
+    try {
+      await updatePaymentOpsApi(storeId, { sslCommerzEnabled: !target.sslCommerzEnabled });
+      await Promise.all([refreshPaymentOpsData(), refreshAuditLogs()]);
+      pushToast("SSLCommerz setting updated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update SSLCommerz");
+    }
   };
 
-  const toggleCod = (storeId: string) => {
+  const toggleCod = async (storeId: string) => {
     if (!canManagePaymentOps) {
       pushToast("You do not have permission to change payment methods.", "error");
       return;
     }
 
-    setPaymentOpsRows((current) =>
-      current.map((row) => (row.storeId === storeId ? { ...row, codEnabled: !row.codEnabled } : row)),
-    );
-    appendAudit("toggled cod payment", storeId, "low");
-    pushToast("COD setting updated.", "success");
+    const target = paymentOpsRows.find((row) => row.storeId === storeId);
+    if (!target) return;
+
+    try {
+      await updatePaymentOpsApi(storeId, { codEnabled: !target.codEnabled });
+      await Promise.all([refreshPaymentOpsData(), refreshAuditLogs()]);
+      pushToast("COD setting updated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update COD");
+    }
   };
 
-  const toggleStripeMode = (storeId: string) => {
+  const toggleStripeMode = async (storeId: string) => {
     if (!canManagePaymentOps) {
       pushToast("You do not have permission to change gateway mode.", "error");
       return;
     }
 
-    setPaymentOpsRows((current) =>
-      current.map((row) =>
-        row.storeId === storeId ? { ...row, stripeMode: row.stripeMode === "live" ? "test" : "live" } : row,
-      ),
-    );
-    appendAudit("toggled stripe mode", storeId, "high");
-    pushToast("Stripe mode switched.", "info");
+    const target = paymentOpsRows.find((row) => row.storeId === storeId);
+    if (!target) return;
+    const nextMode = target.stripeMode === "live" ? "test" : "live";
+
+    try {
+      await updatePaymentOpsApi(storeId, { mode: nextMode });
+      await Promise.all([refreshPaymentOpsData(), refreshAuditLogs()]);
+      pushToast("Stripe mode switched.", "info");
+    } catch (error) {
+      handleApiActionError(error, "Failed to switch Stripe mode");
+    }
   };
 
-  const toggleSslCommerzMode = (storeId: string) => {
+  const toggleSslCommerzMode = async (storeId: string) => {
     if (!canManagePaymentOps) {
       pushToast("You do not have permission to change gateway mode.", "error");
       return;
     }
 
-    setPaymentOpsRows((current) =>
-      current.map((row) =>
-        row.storeId === storeId ? { ...row, sslCommerzMode: row.sslCommerzMode === "live" ? "test" : "live" } : row,
-      ),
-    );
-    appendAudit("toggled sslcommerz mode", storeId, "high");
-    pushToast("SSLCommerz mode switched.", "info");
+    const target = paymentOpsRows.find((row) => row.storeId === storeId);
+    if (!target) return;
+    const nextMode = target.sslCommerzMode === "live" ? "test" : "live";
+
+    try {
+      await updatePaymentOpsApi(storeId, { mode: nextMode });
+      await Promise.all([refreshPaymentOpsData(), refreshAuditLogs()]);
+      pushToast("SSLCommerz mode switched.", "info");
+    } catch (error) {
+      handleApiActionError(error, "Failed to switch SSLCommerz mode");
+    }
   };
 
   const resetFailedCheckouts = (storeId: string) => {
@@ -953,98 +1309,69 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
         row.storeId === storeId ? { ...row, failedCheckout24h: 0, checkoutSuccessRatePct: Math.max(row.checkoutSuccessRatePct, 98) } : row,
       ),
     );
-    appendAudit("reset failed checkout counter", storeId, "medium");
-    pushToast("Checkout failure counter reset.", "success");
+    appendAudit("simulated reset failed checkout counter", storeId, "low");
+    pushToast("Checkout failure counter reset (simulated).", "info");
   };
 
-  const changeSubscriptionPlan = (subscriptionId: string) => {
+  const changeSubscriptionPlan = async (subscriptionId: string) => {
     if (!canManageSubscriptions) {
       pushToast("You have read-only access to subscriptions.", "error");
       return;
     }
 
-    setSubscriptions((current) =>
-      current.map((subscription) => {
-        if (subscription.id !== subscriptionId) return subscription;
+    const target = subscriptions.find((subscription) => subscription.id === subscriptionId);
+    if (!target) return;
+    const nextPlan: StorePlan =
+      target.plan === "Starter" ? "Growth" : target.plan === "Growth" ? "Scale" : "Starter";
 
-        const nextPlan: StorePlan =
-          subscription.plan === "Starter" ? "Growth" : subscription.plan === "Growth" ? "Scale" : "Starter";
-        const nextAmount = subscription.status === "trial" ? 0 : planPrice[nextPlan];
-
-        return { ...subscription, plan: nextPlan, amountUsd: nextAmount };
-      }),
-    );
-
-    setStores((current) =>
-      current.map((store) => {
-        const target = subscriptions.find((subscription) => subscription.id === subscriptionId);
-        if (!target || store.id !== target.storeId) return store;
-        const nextPlan: StorePlan = store.plan === "Starter" ? "Growth" : store.plan === "Growth" ? "Scale" : "Starter";
-        return { ...store, plan: nextPlan };
-      }),
-    );
-    appendAudit("changed subscription plan", subscriptionId, "medium");
-    pushToast("Subscription plan updated.", "success");
+    try {
+      await updateSubscriptionApi(target.storeId, { plan: nextPlan });
+      await Promise.all([refreshSubscriptionsData(), refreshStoresData(), refreshAuditLogs()]);
+      pushToast("Subscription plan updated.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to update subscription plan");
+    }
   };
 
-  const extendTrial = (subscriptionId: string) => {
+  const extendTrial = async (subscriptionId: string) => {
     if (!canManageSubscriptions) {
       pushToast("You have read-only access to subscriptions.", "error");
       return;
     }
 
-    setSubscriptions((current) =>
-      current.map((subscription) => {
-        if (subscription.id !== subscriptionId || subscription.status !== "trial") return subscription;
-        const nextExpiry = addDaysToIso(subscription.expiryDate, 7);
+    const target = subscriptions.find((subscription) => subscription.id === subscriptionId);
+    if (!target || target.status !== "trial") return;
+    const nextExpiry = addDaysToIso(target.expiryDate, 7);
 
-        return {
-          ...subscription,
-          expiryDate: nextExpiry,
-          nextBillingDate: nextExpiry,
-          amountUsd: 0,
-        };
-      }),
-    );
-    appendAudit("extended trial period", subscriptionId, "low");
-    pushToast("Trial extended by 7 days.", "success");
+    try {
+      await updateSubscriptionApi(target.storeId, {
+        status: "trial",
+        nextBillingDate: nextExpiry,
+        expiryDate: nextExpiry,
+      });
+      await Promise.all([refreshSubscriptionsData(), refreshStoresData(), refreshAuditLogs()]);
+      pushToast("Trial extended by 7 days.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to extend trial");
+    }
   };
 
-  const markSubscriptionPaid = (subscriptionId: string) => {
+  const markSubscriptionPaid = async (subscriptionId: string) => {
     if (!canManageSubscriptions) {
       pushToast("You have read-only access to subscriptions.", "error");
       return;
     }
 
-    const today = todayIso();
-    const nextBilling = addDaysToIso(today, 30);
+    const target = subscriptions.find((subscription) => subscription.id === subscriptionId);
+    if (!target || target.status !== "past_due") return;
 
-    setSubscriptions((current) =>
-      current.map((subscription) => {
-        if (subscription.id !== subscriptionId) return subscription;
-        if (subscription.status !== "past_due") return subscription;
-
-        return {
-          ...subscription,
-          status: "active",
-          failedPaymentCount: 0,
-          lastPaymentDate: today,
-          nextBillingDate: nextBilling,
-          expiryDate: nextBilling,
-          amountUsd: planPrice[subscription.plan],
-        };
-      }),
-    );
-
-    setStores((current) =>
-      current.map((store) => {
-        const target = subscriptions.find((subscription) => subscription.id === subscriptionId);
-        if (!target || store.id !== target.storeId) return store;
-        return { ...store, status: "active" };
-      }),
-    );
-    appendAudit("marked subscription paid", subscriptionId, "medium");
-    pushToast("Subscription moved to active.", "success");
+    try {
+      await retrySubscriptionApi(target.storeId);
+      await Promise.all([refreshSubscriptionsData(), refreshStoresData(), refreshAuditLogs()]);
+      pushToast("Subscription moved to active.", "success");
+    } catch (error) {
+      handleApiActionError(error, "Failed to retry subscription");
+    }
   };
 
   const toggleSuspendSubscription = (subscriptionId: string) => {
@@ -1056,8 +1383,6 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
     const target = subscriptions.find((subscription) => subscription.id === subscriptionId);
     if (!target) return;
 
-    const today = todayIso();
-    const nextBilling = addDaysToIso(today, 30);
     const isReactivate = target.status === "cancelled";
 
     requestConfirm({
@@ -1068,74 +1393,58 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       confirmLabel: isReactivate ? "Reactivate" : "Suspend",
       tone: isReactivate ? "default" : "danger",
       onConfirm: () => {
-        setSubscriptions((current) =>
-          current.map((subscription) => {
-            if (subscription.id !== subscriptionId) return subscription;
-
-            if (subscription.status === "cancelled") {
-              return {
-                ...subscription,
-                status: "active",
-                amountUsd: planPrice[subscription.plan],
-                nextBillingDate: nextBilling,
-                expiryDate: nextBilling,
-              };
+        void (async () => {
+          try {
+            if (isReactivate) {
+              await retrySubscriptionApi(target.storeId);
+            } else {
+              await cancelSubscriptionApi(target.storeId);
             }
 
-            return {
-              ...subscription,
-              status: "cancelled",
-              nextBillingDate: "N/A",
-              expiryDate: today,
-            };
-          }),
-        );
-
-        setStores((current) =>
-          current.map((store) => {
-            const linked = subscriptions.find((subscription) => subscription.id === subscriptionId);
-            if (!linked || store.id !== linked.storeId) return store;
-
-            const nextStoreStatus = linked.status === "cancelled" ? "active" : "suspended";
-            return { ...store, status: nextStoreStatus };
-          }),
-        );
-
-        appendAudit(`${isReactivate ? "reactivated" : "suspended"} subscription`, subscriptionId, "high");
-        pushToast(`Subscription ${isReactivate ? "reactivated" : "suspended"}.`, "success");
+            await Promise.all([refreshSubscriptionsData(), refreshStoresData(), refreshAuditLogs()]);
+            pushToast(`Subscription ${isReactivate ? "reactivated" : "suspended"}.`, "success");
+          } catch (error) {
+            handleApiActionError(error, "Failed to update subscription state");
+          }
+        })();
       },
     });
   };
+
+  const overviewRevenue = overviewMetrics?.totalRevenue ?? monthlyRecurringRevenue;
+  const overviewOrders = overviewMetrics?.totalOrders ?? 0;
+  const overviewActiveStores = overviewMetrics?.activeStores ?? activeStores;
+  const overviewFailedPayments = overviewMetrics?.failedPayments ?? failedCollections;
 
   const renderOverview = () => (
     <>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard
-          title="Platform MRR"
-          value={usd(monthlyRecurringRevenue)}
-          delta="+12.6%"
+          title="Total Revenue"
+          value={usd(overviewRevenue)}
+          delta={`${overviewOrders.toLocaleString("en-US")} orders`}
           hint={timeframeLabel}
           icon={<Wallet className="h-4 w-4" />}
         />
         <MetricCard
-          title="Total Stores"
-          value={String(stores.length)}
-          delta="+5.1%"
-          hint={`${activeStores} active`}
+          title="Active Stores"
+          value={String(overviewActiveStores)}
+          delta={`${stores.length} tracked`}
+          hint="cross-section derived"
           icon={<Store className="h-4 w-4" />}
         />
         <MetricCard
-          title="Active Admins"
-          value={String(activeAdmins)}
-          delta="+2"
-          hint="internal operators"
-          icon={<ShieldCheck className="h-4 w-4" />}
+          title="Failed Payments"
+          value={String(overviewFailedPayments)}
+          delta={`${pastDueCount} past due`}
+          hint={timeframeLabel}
+          icon={<CreditCard className="h-4 w-4" />}
         />
         <MetricCard
           title="AI Cost"
           value={usd(aiCost)}
-          delta="+8.4%"
-          hint={timeframeLabel}
+          delta={`${modelUsageRows.length} models`}
+          hint="cost from AI usage"
           icon={<Bot className="h-4 w-4" />}
         />
       </div>
@@ -1163,21 +1472,29 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
         </SectionCard>
 
         <SectionCard title="Incidents" subtitle="Recent platform events" className="xl:col-span-2">
-          <div className="space-y-3">
-            {incidentRecords.map((incident) => (
-              <div key={incident.id} className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-sm font-semibold text-slate-800">{incident.title}</p>
-                  <span className={pillClass(incident.level === "critical" ? "red" : incident.level === "warning" ? "amber" : "slate")}>
-                    {incident.level}
-                  </span>
+          {incidents.length ? (
+            <div className="space-y-3">
+              {incidents.map((incident) => (
+                <div key={incident.id} className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-semibold text-slate-800">{incident.title}</p>
+                    <span
+                      className={pillClass(
+                        incident.level === "critical" ? "red" : incident.level === "warning" ? "amber" : "slate",
+                      )}
+                    >
+                      {incident.level}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {incident.id} - {incident.startedAt} - {incident.status}
+                  </p>
                 </div>
-                <p className="mt-1 text-xs text-slate-500">
-                  {incident.id} - {incident.startedAt} - {incident.status}
-                </p>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState title="No incidents" description="No recent incidents returned by backend." />
+          )}
         </SectionCard>
       </div>
     </>
@@ -1497,7 +1814,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
                           disabled={!canManageLifecycle}
                           className="rounded-lg bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          Theme Synced
+                          Theme Synced (Simulated)
                         </button>
                       </div>
                     </td>
@@ -1679,7 +1996,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
                           disabled={!canManagePaymentOps}
                           className="rounded-lg bg-brand-soft px-2.5 py-1 text-xs font-semibold text-brand-deep hover:bg-brand-soft/80 disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          Reset Failures
+                          Reset Failures (Simulated)
                         </button>
                       </td>
                     </tr>
@@ -2102,12 +2419,12 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
       <SectionCard title="Safety Controls" subtitle="Global operational switches">
         <div className="space-y-3">
           <button
-            onClick={() => setMaintenanceMode((current) => !current)}
+            onClick={toggleMaintenanceMode}
             className={`w-full rounded-xl px-4 py-2.5 text-sm font-semibold ${
               maintenanceMode ? "bg-red-600 text-white hover:bg-red-700" : "bg-brand text-white hover:bg-brand-deep"
             }`}
           >
-            {maintenanceMode ? "Disable Maintenance Mode" : "Enable Maintenance Mode"}
+            {maintenanceMode ? "Disable Maintenance Mode (Simulated)" : "Enable Maintenance Mode (Simulated)"}
           </button>
           <p className="text-xs text-slate-500">
             Maintenance mode should be enabled only for migrations that require checkout freeze.
@@ -2122,42 +2439,46 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
   );
 
   const renderAIUsage = () => {
-    const totalCost = modelUsageRecords.reduce((sum, model) => sum + model.costUsd, 0);
+    const totalCost = modelUsageRows.reduce((sum, model) => sum + model.costUsd, 0);
 
     return (
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         <SectionCard title="Model Cost and Quota" subtitle="Provider-level breakdown" className="xl:col-span-2">
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[680px] text-left text-sm">
-              <thead>
-                <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500">
-                  <th className="pb-3">Model</th>
-                  <th className="pb-3">Requests</th>
-                  <th className="pb-3">Tokens</th>
-                  <th className="pb-3">Cost</th>
-                  <th className="pb-3">Quota</th>
-                </tr>
-              </thead>
-              <tbody>
-                {modelUsageRecords.map((model) => (
-                  <tr key={model.model} className="border-b border-slate-100 last:border-0">
-                    <td className="py-3 font-semibold text-slate-800">{model.model}</td>
-                    <td className="py-3">{model.requests.toLocaleString("en-US")}</td>
-                    <td className="py-3">{model.tokens.toLocaleString("en-US")}</td>
-                    <td className="py-3">{usd(model.costUsd)}</td>
-                    <td className="py-3">
-                      <div className="w-36">
-                        <div className="mb-1 text-xs text-slate-500">{model.quotaPct}%</div>
-                        <div className="h-2 rounded-full bg-slate-100">
-                          <div className="h-2 rounded-full bg-brand" style={{ width: `${model.quotaPct}%` }} />
-                        </div>
-                      </div>
-                    </td>
+          {modelUsageRows.length ? (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[680px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500">
+                    <th className="pb-3">Model</th>
+                    <th className="pb-3">Requests</th>
+                    <th className="pb-3">Tokens</th>
+                    <th className="pb-3">Cost</th>
+                    <th className="pb-3">Quota</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {modelUsageRows.map((model) => (
+                    <tr key={model.model} className="border-b border-slate-100 last:border-0">
+                      <td className="py-3 font-semibold text-slate-800">{model.model}</td>
+                      <td className="py-3">{model.requests.toLocaleString("en-US")}</td>
+                      <td className="py-3">{model.tokens.toLocaleString("en-US")}</td>
+                      <td className="py-3">{usd(model.costUsd)}</td>
+                      <td className="py-3">
+                        <div className="w-36">
+                          <div className="mb-1 text-xs text-slate-500">{model.quotaPct}%</div>
+                          <div className="h-2 rounded-full bg-slate-100">
+                            <div className="h-2 rounded-full bg-brand" style={{ width: `${model.quotaPct}%` }} />
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState title="No model usage" description="AI usage endpoint returned no model rows." />
+          )}
         </SectionCard>
 
         <SectionCard title="Budget Guardrail" subtitle="AI spend control">
@@ -2167,8 +2488,14 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
             <div className="h-2 rounded-full bg-sunset" style={{ width: `${Math.min(100, (totalCost / 150) * 100)}%` }} />
           </div>
           <p className="mt-2 text-xs text-slate-500">Soft limit: $150</p>
-          <button className="mt-4 w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800">
-            Update Hard Cap
+          <button
+            onClick={() => {
+              appendAudit("simulated ai hard cap update", "ai-budget", "medium");
+              pushToast("AI hard cap update is simulated.", "info");
+            }}
+            className="mt-4 w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
+          >
+            Update Hard Cap (Simulated)
           </button>
         </SectionCard>
       </div>
@@ -2263,12 +2590,12 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
               pushToast("Only super admin can rotate platform keys.", "error");
               return;
             }
-            appendAudit("rotated platform keys", "platform-keys", "high");
-            pushToast("Platform keys rotation scheduled.", "success");
+            appendAudit("simulated platform key rotation", "platform-keys", "high");
+            pushToast("Platform key rotation is simulated.", "info");
           }}
           className="mt-4 w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
         >
-          Rotate Platform Keys
+          Rotate Platform Keys (Simulated)
         </button>
       </SectionCard>
     </div>
@@ -2276,7 +2603,7 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
 
   const renderSettings = () => (
     <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-      <SectionCard title="Core Settings" subtitle="Saved locally for backend integration later" className="xl:col-span-2">
+      <SectionCard title="Core Settings" subtitle="Persisted via platform settings API" className="xl:col-span-2">
         {canManageSettings ? (
           <>
             <form className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -2318,28 +2645,16 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
             </form>
             <div className="mt-4 flex flex-wrap gap-2">
               <button
-                onClick={() => {
-                  appendAudit("saved core settings draft", "platform-settings", "medium");
-                  pushToast("Settings draft saved.", "success");
-                }}
+                onClick={() => void saveCoreSettingsDraft()}
                 className="rounded-xl bg-brand px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-deep"
               >
                 Save Draft
               </button>
               <button
-                onClick={() => {
-                  appendAudit("pushed core settings to production", "platform-settings", "high");
-                  pushToast("Settings pushed to production.", "success");
-                }}
+                onClick={() => void pushSettingsToProduction()}
                 className="rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100"
               >
                 Push to Production
-              </button>
-              <button
-                onClick={() => setDataState("error")}
-                className="rounded-xl border border-red-200 px-4 py-2.5 text-sm font-semibold text-red-700 hover:bg-red-50"
-              >
-                Simulate Data Error
               </button>
             </div>
           </>
@@ -2387,20 +2702,10 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
               />
             </Field>
             <button
-              onClick={() => {
-                setSubscriptions((current) =>
-                  current.map((subscription) =>
-                    subscription.status === "active"
-                      ? { ...subscription, amountUsd: planPrice[subscription.plan] }
-                      : subscription,
-                  ),
-                );
-                appendAudit("updated plan settings", "plan-policy", "high");
-                pushToast("Plan settings updated and active subscription pricing synced.", "success");
-              }}
+              onClick={() => void savePlanRules()}
               className="w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
             >
-              Save Plan Rules
+              Save Plan Rules (Pricing Sync Simulated)
             </button>
           </div>
         ) : (
@@ -2491,8 +2796,8 @@ function DashboardPage({ session, onLogout }: { session: AuthSession; onLogout: 
 
           <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-xs text-slate-600">
             <Server className="h-4 w-4 text-brand-deep" />
-            Backend integration pending.
-            <span className="font-semibold text-slate-800">All modules are frontend-ready with mock state and actions.</span>
+            Dashboard data is API-driven.
+            <span className="font-semibold text-slate-800">Only labeled simulated actions use local state.</span>
           </div>
         </main>
       </div>
@@ -2658,6 +2963,14 @@ function daysSinceIso(isoDate: string) {
   return Math.floor(diffMs / (1000 * 60 * 60 * 24));
 }
 
+function nextAuditId(entries: AuditLog[]) {
+  return nextIdFromExisting(
+    entries.map((entry) => entry.id),
+    "AUD-",
+    0,
+  );
+}
+
 function nextIdFromExisting(existingIds: string[], prefix: string, fallbackStart: number) {
   const max = existingIds.reduce((largest, id) => {
     const numeric = Number.parseInt(id.replace(prefix, ""), 10);
@@ -2760,19 +3073,23 @@ function EmptyState({ title, description }: { title: string; description: string
   );
 }
 
-function LoginPage({ onLogin }: { onLogin: (email: string, password: string) => boolean }) {
-  const [email, setEmail] = useState("mahin@nexus.ai");
-  const [password, setPassword] = useState("admin123");
+function LoginPage({ onLogin }: { onLogin: (email: string, password: string) => Promise<LoginResult> }) {
+  const [email, setEmail] = useState("admin@1mis.io");
+  const [password, setPassword] = useState("admin12345");
   const [error, setError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const handleSubmit = (event: FormEvent) => {
+  const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    const ok = onLogin(email, password);
-    if (!ok) {
-      setError("Invalid credentials. Try one of the demo accounts.");
+    setIsSubmitting(true);
+    const result = await onLogin(email, password);
+    if (!result.ok) {
+      setError(result.message || "Invalid credentials.");
+      setIsSubmitting(false);
       return;
     }
     setError("");
+    setIsSubmitting(false);
   };
 
   return (
@@ -2805,17 +3122,17 @@ function LoginPage({ onLogin }: { onLogin: (email: string, password: string) => 
 
           {error ? <p className="text-xs font-semibold text-red-600">{error}</p> : null}
 
-          <button className="w-full rounded-xl bg-brand px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-deep">
-            Sign In
+          <button
+            disabled={isSubmitting}
+            className="w-full rounded-xl bg-brand px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-deep disabled:cursor-not-allowed disabled:opacity-70"
+          >
+            {isSubmitting ? "Signing in..." : "Sign In"}
           </button>
         </form>
 
         <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-          <p className="font-semibold text-slate-700">Demo Accounts</p>
-          <p className="mt-1">mahin@nexus.ai / admin123 (super admin)</p>
-          <p>sadia.ops@nexus.ai / ops123 (ops)</p>
-          <p>jannat.support@nexus.ai / support123 (support)</p>
-          <p>riyad.finance@nexus.ai / finance123 (finance)</p>
+          <p className="font-semibold text-slate-700">Seeded Account</p>
+          <p className="mt-1">admin@1mis.io / admin12345 (super admin)</p>
         </div>
       </div>
     </div>
@@ -2843,3 +3160,4 @@ function persistSession(session: AuthSession | null) {
   }
   window.localStorage.setItem("super-admin-session", JSON.stringify(session));
 }
+
