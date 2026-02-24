@@ -62,6 +62,17 @@ export interface OverviewResponse {
   aiJobs: number;
 }
 
+export interface HealthSnapshot {
+  services: ServiceRecord[];
+  maintenanceMode: boolean;
+}
+
+export interface AiUsageSnapshot {
+  models: ModelUsageRecord[];
+  hardCapUsd: number;
+  utilizationPct: number;
+}
+
 const DEFAULT_CORE_SETTINGS: CoreSettingsPayload = {
   platformName: "Nexus Commerce Cloud",
   defaultCurrency: "USD",
@@ -383,6 +394,14 @@ export async function updateLifecycle(
   return mapLifecycleRecord(row);
 }
 
+export async function markThemeSynced(storeId: string, at?: string) {
+  const row = await apiRequest<Record<string, unknown>>(`/api/super-admin/lifecycle/${storeId}/theme-sync`, {
+    method: "POST",
+    body: JSON.stringify(at ? { at } : {}),
+  });
+  return mapLifecycleRecord(row);
+}
+
 export async function fetchAdmins() {
   const rows = await apiRequest<Record<string, unknown>[]>("/api/super-admin/admins");
   return rows.map(mapAdminRecord);
@@ -451,6 +470,16 @@ export async function cancelSubscription(storeId: string) {
   return mapSubscriptionRecord(row);
 }
 
+export async function syncSubscriptionPricing() {
+  return apiRequest<{
+    updated: number;
+    skipped: number;
+    prices: Record<StorePlan, number>;
+  }>("/api/super-admin/subscriptions/sync-pricing", {
+    method: "POST",
+  });
+}
+
 export async function fetchPaymentOps() {
   const rows = await apiRequest<Record<string, unknown>[]>("/api/super-admin/payment-ops");
   return rows.map(mapPaymentOpsRecord);
@@ -468,6 +497,13 @@ export async function updatePaymentOps(
   const row = await apiRequest<Record<string, unknown>>(`/api/super-admin/payment-ops/${storeId}`, {
     method: "PATCH",
     body: JSON.stringify(payload),
+  });
+  return mapPaymentOpsRecord(row);
+}
+
+export async function resetPaymentFailures(storeId: string) {
+  const row = await apiRequest<Record<string, unknown>>(`/api/super-admin/payment-ops/${storeId}/reset-failures`, {
+    method: "POST",
   });
   return mapPaymentOpsRecord(row);
 }
@@ -493,8 +529,14 @@ export async function updateTicket(
 }
 
 export async function fetchHealth() {
-  const response = await apiRequest<{ services: Record<string, unknown>[] }>("/api/super-admin/health");
-  return (response.services || []).map(mapServiceRecord);
+  const response = await apiRequest<{
+    services: Record<string, unknown>[];
+    maintenanceMode?: unknown;
+  }>("/api/super-admin/health");
+  return {
+    services: (response.services || []).map(mapServiceRecord),
+    maintenanceMode: asBoolean(response.maintenanceMode, false),
+  } satisfies HealthSnapshot;
 }
 
 export async function restartService(service: string) {
@@ -506,9 +548,34 @@ export async function restartService(service: string) {
   );
 }
 
+export async function setMaintenanceMode(enabled: boolean) {
+  return apiRequest<{
+    enabled: boolean;
+    updatedAt: string;
+  }>("/api/super-admin/health/maintenance", {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export async function fetchAiUsage() {
-  const response = await apiRequest<{ models: Record<string, unknown>[] }>("/api/super-admin/ai-usage");
-  return (response.models || []).map(mapModelUsageRecord);
+  const response = await apiRequest<{
+    models: Record<string, unknown>[];
+    hardCapUsd?: unknown;
+    utilizationPct?: unknown;
+  }>("/api/super-admin/ai-usage");
+  return {
+    models: (response.models || []).map(mapModelUsageRecord),
+    hardCapUsd: Math.max(1, asNumber(response.hardCapUsd, 150)),
+    utilizationPct: Math.max(0, Math.min(100, asNumber(response.utilizationPct, 0))),
+  } satisfies AiUsageSnapshot;
+}
+
+export async function updateAiHardCap(hardCapUsd: number) {
+  return apiRequest<{ hardCapUsd: number; updatedAt: string }>("/api/super-admin/ai-usage/hard-cap", {
+    method: "PATCH",
+    body: JSON.stringify({ hardCapUsd }),
+  });
 }
 
 export async function fetchFlags() {
@@ -595,6 +662,17 @@ export async function updateIncident(
     body: JSON.stringify(payload),
   });
   return mapIncidentRecord(row);
+}
+
+export async function rotatePlatformKeys() {
+  return apiRequest<{
+    rotated: boolean;
+    keyVersion: number;
+    keyId: string;
+    rotatedAt: string;
+  }>("/api/super-admin/security/rotate-keys", {
+    method: "POST",
+  });
 }
 
 export async function loadSettingsForms() {
